@@ -12,7 +12,7 @@
 
 <title>LUDIQ - Money Spender Game</title>
 
-<!-- PRELOAD: start downloading heavy files IMMEDIATELY -->
+<!-- PRELOAD: hint browser to start downloading heavy files early -->
 <link rel="preload" href="love.wasm" as="fetch" crossorigin>
 <link rel="preload" href="game.data" as="fetch" crossorigin>
 <link rel="preload" href="love.js" as="script">
@@ -41,9 +41,9 @@ html,body{width:100%!important;height:100%!important;height:100dvh!important;bac
 .ld-title{font-family:'Press Start 2P',monospace;font-size:clamp(0.55rem,2.5vw,0.9rem);color:#FFB800;text-shadow:0 0 8px #FFB800}
 .ld-sub{font-family:'Press Start 2P',monospace;font-size:clamp(0.3rem,1.2vw,0.42rem);color:#ff9900;margin-top:4px;margin-bottom:clamp(16px,3vh,28px)}
 .ld-bar-wrap{width:78%;max-width:320px;height:12px;border-radius:20px;background:#151525;overflow:hidden;border:1px solid #252540}
-#bar{width:0%;height:100%;background:linear-gradient(90deg,#FFB800,#FF6B2C);border-radius:20px;transition:width 0.12s linear}
+#bar{width:0%;height:100%;background:linear-gradient(90deg,#FFB800,#FF6B2C);border-radius:20px;transition:width 0.15s linear}
 #pct{font-family:'Press Start 2P',monospace;font-size:clamp(0.45rem,2vw,0.7rem);color:#FFB800;margin-top:clamp(8px,1.5vh,14px)}
-#dlInfo{font-family:'Press Start 2P',monospace;font-size:clamp(0.22rem,0.9vw,0.32rem);color:#444;margin-top:5px}
+#dlInfo{font-family:'Press Start 2P',monospace;font-size:clamp(0.22rem,0.9vw,0.32rem);color:#444;margin-top:5px;min-height:1.2em}
 .fadeOut{animation:fadeAway 0.5s forwards;pointer-events:none}
 @keyframes fadeAway{to{opacity:0;visibility:hidden}}
 #rotatePrompt{display:none;position:fixed;inset:0;background:#000000f5!important;color:white;font-family:'Press Start 2P',monospace;flex-direction:column;justify-content:center;align-items:center;z-index:9999;text-align:center}
@@ -167,31 +167,6 @@ function showIOSBackBtn(){
   }
 }
 
-var gameStarted=false;
-
-function runGame(){
-  if(gameStarted)return;
-  gameStarted=true;
-  if(!isStandalone){enterFullscreen();if(isIOS)iosHideBar()}
-  unlockAudio();
-  showIOSBackBtn();
-  document.getElementById('splash').style.display='none';
-  document.getElementById('loader').style.display='flex';
-  setCanvasSize();
-
-  // PARALLEL loading (both scripts at once)
-  var loaded=0;
-  function checkBothLoaded(){loaded++;if(loaded===2)applicationLoad()}
-  var s1=document.createElement('script');
-  s1.src='game.js';
-  s1.onload=checkBothLoaded;
-  document.body.appendChild(s1);
-  var s2=document.createElement('script');
-  s2.src='love.js';
-  s2.onload=checkBothLoaded;
-  document.body.appendChild(s2);
-}
-
 function enterFullscreen(){
   if(isNavigating)return;
   var el=document.documentElement;
@@ -292,46 +267,237 @@ document.addEventListener('visibilitychange',function(){
   }catch(e){}
 });
 
-var Module={
-  arguments:["./game.love"],
-  INITIAL_MEMORY:33554432,  // 32MB (not 48MB or 96MB)
-  canvas:(function(){return document.getElementById("canvas")})(),
-  preinitializedWebGLContext:_preGLContext,
-  print:function(){},
-  printErr:function(){},
-  setStatus:function(text){
-    if(isNavigating)return;
-    if(!text){
-      document.getElementById("pct").textContent="100%";
-      document.getElementById("bar").style.width="100%";
-      document.getElementById("dlInfo").textContent="Starting game...";
-      var loader=document.getElementById("loader");
-      var canvas=document.getElementById("canvas");
-      if(loader)loader.classList.add("fadeOut");
-      if(canvas){canvas.style.visibility="visible";setCanvasSize();resizeCanvas();if(!isStandalone)enterFullscreen()}
-      setTimeout(function(){
-        var s=document.getElementById('splash');var l=document.getElementById('loader');
-        if(s&&s.parentNode)s.parentNode.removeChild(s);
-        if(l&&l.parentNode)l.parentNode.removeChild(l);
-      },1000);
+/* ============================================================
+   PROGRESS TRACKING SYSTEM
+   Downloads love.wasm + game.data with real byte-level progress
+   BEFORE loading Emscripten scripts, so the bar actually moves.
+   ============================================================ */
+
+var barEl, pctEl, dlInfoEl;
+var gameStarted = false;
+
+// Phases and their weight in the progress bar (total = 100%)
+// Phase 1: Download assets      (0% - 70%)   — real byte progress
+// Phase 2: Load scripts         (70% - 80%)  — fast, small JS files
+// Phase 3: WASM compile + init  (80% - 100%) — animated, no real events
+
+var currentProgress = 0;
+
+function setProgress(pct, info) {
+  pct = Math.min(100, Math.max(0, Math.round(pct)));
+  // Never go backwards
+  if (pct < currentProgress) pct = currentProgress;
+  currentProgress = pct;
+  if (barEl) barEl.style.width = pct + '%';
+  if (pctEl) pctEl.textContent = pct + '%';
+  if (dlInfoEl && info !== undefined) dlInfoEl.textContent = info;
+}
+
+// Fetch a file with real download progress via ReadableStream
+function fetchWithProgress(url) {
+  return new Promise(function(resolve, reject) {
+    // Try ReadableStream progress (modern browsers)
+    fetch(url).then(function(response) {
+      if (!response.ok) { reject(new Error('HTTP ' + response.status)); return; }
+      var contentLength = response.headers.get('content-length');
+      var total = contentLength ? parseInt(contentLength, 10) : 0;
+
+      // If no content-length or no ReadableStream, fall back
+      if (!total || !response.body || !response.body.getReader) {
+        response.arrayBuffer().then(function(buf) {
+          resolve({ url: url, size: buf.byteLength });
+        });
+        return;
+      }
+
+      var reader = response.body.getReader();
+      var received = 0;
+      var chunks = [];
+
+      function pump() {
+        reader.read().then(function(result) {
+          if (result.done) {
+            resolve({ url: url, size: received });
+            return;
+          }
+          chunks.push(result.value);
+          received += result.value.length;
+          // Report per-file progress to the combined tracker
+          onFileProgress(url, received, total);
+          pump();
+        }).catch(reject);
+      }
+      pump();
+    }).catch(reject);
+  });
+}
+
+// Track combined download progress across multiple files
+var fileSizes = {};      // url -> expected total bytes
+var fileLoaded = {};     // url -> bytes received so far
+var totalExpectedBytes = 0;
+var filesToDownload = ['love.wasm', 'game.data'];
+
+function onFileProgress(url, loaded, total) {
+  fileLoaded[url] = loaded;
+  if (total && !fileSizes[url]) {
+    fileSizes[url] = total;
+    totalExpectedBytes = 0;
+    for (var k in fileSizes) totalExpectedBytes += fileSizes[k];
+  }
+
+  // Calculate combined progress
+  var totalLoaded = 0;
+  for (var k in fileLoaded) totalLoaded += fileLoaded[k];
+
+  if (totalExpectedBytes > 0) {
+    var dlPct = (totalLoaded / totalExpectedBytes);
+    // Downloads are 0-70% of total progress
+    var overallPct = Math.round(dlPct * 70);
+    var mbLoaded = (totalLoaded / 1048576).toFixed(1);
+    var mbTotal = (totalExpectedBytes / 1048576).toFixed(1);
+    setProgress(overallPct, mbLoaded + ' / ' + mbTotal + ' MB');
+  }
+}
+
+// Animated progress for phases without real progress events
+var animInterval = null;
+function animateProgress(from, to, duration, info, callback) {
+  var start = Date.now();
+  if (animInterval) clearInterval(animInterval);
+  animInterval = setInterval(function() {
+    var elapsed = Date.now() - start;
+    var t = Math.min(1, elapsed / duration);
+    // Ease out curve — fast start, slow end (feels responsive)
+    var eased = 1 - Math.pow(1 - t, 3);
+    var pct = Math.round(from + (to - from) * eased);
+    setProgress(pct, info);
+    if (t >= 1) {
+      clearInterval(animInterval);
+      animInterval = null;
+      if (callback) callback();
+    }
+  }, 50);
+}
+
+function loadScript(src) {
+  return new Promise(function(resolve, reject) {
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.body.appendChild(s);
+  });
+}
+
+function runGame() {
+  if (gameStarted) return;
+  gameStarted = true;
+  if (!isStandalone) { enterFullscreen(); if (isIOS) iosHideBar(); }
+  unlockAudio();
+  showIOSBackBtn();
+  document.getElementById('splash').style.display = 'none';
+  document.getElementById('loader').style.display = 'flex';
+  setCanvasSize();
+
+  barEl = document.getElementById('bar');
+  pctEl = document.getElementById('pct');
+  dlInfoEl = document.getElementById('dlInfo');
+
+  setProgress(1, 'Connecting...');
+
+  // PHASE 1: Download heavy files with real progress (0% - 70%)
+  Promise.all([
+    fetchWithProgress('love.wasm'),
+    fetchWithProgress('game.data')
+  ]).then(function(results) {
+    setProgress(70, 'Downloads complete');
+
+    // PHASE 2: Load JS scripts (70% - 80%)
+    setProgress(72, 'Loading scripts...');
+    return Promise.all([
+      loadScript('game.js'),
+      loadScript('love.js')
+    ]);
+  }).then(function() {
+    // PHASE 3: WASM compilation + init (80% - 99%)
+    // Emscripten compiles WASM here — no progress events available
+    // Animate smoothly so user sees movement
+    setProgress(80, 'Compiling engine...');
+    animateProgress(80, 95, 4000, 'Starting engine...');
+
+    // Hand off to Emscripten
+    applicationLoad();
+  }).catch(function(err) {
+    setProgress(0, 'Load error — tap to retry');
+    console.error('Load failed:', err);
+    gameStarted = false;
+    // Allow retry
+    document.getElementById('loader').addEventListener('click', function() {
+      document.getElementById('loader').style.display = 'none';
+      document.getElementById('splash').style.display = 'flex';
+    }, { once: true });
+  });
+}
+
+/* ============================================================
+   EMSCRIPTEN MODULE CONFIG
+   ============================================================ */
+
+var Module = {
+  arguments: ["./game.love"],
+  INITIAL_MEMORY: 33554432,
+  canvas: (function(){ return document.getElementById("canvas") })(),
+  preinitializedWebGLContext: _preGLContext,
+  print: function(){},
+  printErr: function(){},
+
+  setStatus: function(text) {
+    if (isNavigating) return;
+    if (!text) {
+      // Emscripten is done — game is ready
+      if (animInterval) { clearInterval(animInterval); animInterval = null; }
+      setProgress(100, 'Launching!');
+
+      var loader = document.getElementById("loader");
+      var canvas = document.getElementById("canvas");
+      if (loader) loader.classList.add("fadeOut");
+      if (canvas) {
+        canvas.style.visibility = "visible";
+        setCanvasSize();
+        resizeCanvas();
+        if (!isStandalone) enterFullscreen();
+      }
+      setTimeout(function() {
+        var s = document.getElementById('splash');
+        var l = document.getElementById('loader');
+        if (s && s.parentNode) s.parentNode.removeChild(s);
+        if (l && l.parentNode) l.parentNode.removeChild(l);
+      }, 800);
       return;
     }
-    var m=text.match(/\((\d+)\/(\d+)\)/);
-    if(m){
-      var loaded=parseInt(m[1]),total=parseInt(m[2]);
-      var p=Math.min(99,Math.round((loaded/total)*100));
-      document.getElementById("bar").style.width=p+"%";
-      document.getElementById("pct").textContent=p+"%";
-      document.getElementById("dlInfo").textContent=(loaded/1048576).toFixed(1)+" / "+(total/1048576).toFixed(1)+" MB";
+
+    // Emscripten progress events (extracting game data, etc.)
+    var m = text.match(/\((\d+)\/(\d+)\)/);
+    if (m) {
+      var loaded = parseInt(m[1]), total = parseInt(m[2]);
+      // Map Emscripten's internal progress to 85-99% range
+      var emPct = Math.round(85 + (loaded / total) * 14);
+      setProgress(emPct, 'Unpacking game...');
     }
   },
-  monitorRunDependencies:function(left){
-    var t=this.totalDependencies||0;
-    this.totalDependencies=Math.max(t,left);
+
+  monitorRunDependencies: function(left) {
+    var t = this.totalDependencies || 0;
+    this.totalDependencies = Math.max(t, left);
+    if (t > 0 && left === 0) {
+      // All dependencies resolved
+      setProgress(99, 'Almost ready...');
+    }
   }
 };
 
-function applicationLoad(){Love(Module)}
+function applicationLoad() { Love(Module); }
 resizeCanvas();
 </script>
 
